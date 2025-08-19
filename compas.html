@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Пиксельный компас домой</title>
+<style>
+  :root { color-scheme: dark; }
+  body{
+    margin:0; height:100dvh; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; background:#0c0c0c; color:#eee;
+    font-family:system-ui, Arial, sans-serif; gap:14px; padding:12px;
+  }
+  canvas{ image-rendering: pixelated; image-rendering: crisp-edges; }
+  #info{opacity:.9; font-size:14px; text-align:center; max-width:640px}
+  button{
+    padding:10px 14px; border:0; border-radius:14px; background:#222; color:#eee;
+    box-shadow:0 6px 24px #0006; cursor:pointer; display:none;
+  }
+</style>
+</head>
+<body>
+  <canvas id="compass" width="384" height="384" aria-label="Пиксельный компас"></canvas>
+  <div id="info">Ожидание разрешений…</div>
+  <button id="enableBtn">Включить компас (iPhone)</button>
+
+<script>
+/* ===== НАСТРОЙКИ ===== */
+// Точка назначения — твой дом (из сообщения): 40°21'50.9"N 49°56'48.3"E
+const TARGET = { lat: 40.364139, lon: 49.946750 };
+
+// Сетка (мало крупных пикселей):
+const GRID = 24;     // 24×24 «крупных пикселей» (можно 20, 16 и т.д.)
+const PIX  = 16;     // размер одного крупного пикселя в экранах (канвас = GRID*PIX)
+
+/* ===== КАНВАС ===== */
+const cvs = document.getElementById('compass');
+const ctx = cvs.getContext('2d');
+cvs.width  = GRID * PIX;
+cvs.height = GRID * PIX;
+
+/* ===== СОСТОЯНИЕ ===== */
+let heading = 0;             // куда смотрит телефон (0° = север, по часовой)
+let myPos = null;            // {lat, lon}
+const info = document.getElementById('info');
+const enableBtn = document.getElementById('enableBtn');
+
+/* ===== ВСПОМОГАТЕЛЬНОЕ ===== */
+const toRad = d => d * Math.PI/180;
+const toDeg = r => r * 180/Math.PI;
+
+function bearing(lat1, lon1, lat2, lon2){
+  const φ1 = toRad(lat1), φ2 = toRad(lat2), Δλ = toRad(lon2-lon1);
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
+  return (toDeg(Math.atan2(y,x)) + 360) % 360; // 0..360 (0 = север)
+}
+
+function pset(x, y, color){
+  // Рисуем один «крупный пиксель» по координатам сетки
+  ctx.fillStyle = color;
+  ctx.fillRect(Math.round(x)*PIX, Math.round(y)*PIX, PIX, PIX);
+}
+
+/* ===== ФОН КОМПАСА (минимализм, без меток) ===== */
+function drawBase(){
+  ctx.clearRect(0,0,cvs.width,cvs.height);
+  const cx = GRID/2, cy = GRID/2;
+  const rOuter = GRID*0.48;
+  const rRim   = GRID*0.43;
+  const rFace  = GRID*0.38;
+
+  for (let y=0;y<GRID;y++){
+    for (let x=0;x<GRID;x++){
+      const dx = x+0.5 - cx, dy = y+0.5 - cy;
+      const r = Math.hypot(dx, dy);
+      let col = null;
+      if (r <= rFace){                    // лицевая часть (тёмная линза)
+        col = '#1b1d20';
+      } else if (r <= rRim){              // металлический обод
+        col = '#666b74';
+      } else if (r <= rOuter){            // внешняя окантовка
+        col = '#0e0f12';
+      }
+      if (col){
+        const noise = ((x^y)&1) ? -10 : 0; // лёгкая пиксельная текстура
+        col = shade(col, noise);
+        pset(x,y,col);
+      }
+    }
+  }
+}
+
+function shade(hex, delta){
+  const n = v => Math.max(0, Math.min(255, v+delta));
+  const r = n(parseInt(hex.slice(1,3),16));
+  const g = n(parseInt(hex.slice(3,5),16));
+  const b = n(parseInt(hex.slice(5,7),16));
+  return `rgb(${r},${g},${b})`;
+}
+
+/* ===== СТРЕЛКА «как в майне»: 6 красных + 3 серых ===== */
+// Мы рисуем точки ровно по сетке от центра: 6 шагов вперёд (к носу) и 3 назад (хвост).
+function drawNeedle(angleDeg){
+  const cx = Math.round(GRID/2), cy = Math.round(GRID/2);
+  const fwd = 6;  // 6 красных
+  const back = 3; // 3 серых
+  const a = toRad(angleDeg);
+  const ux = Math.sin(a);       // единичный вектор по углу (x по часовой восток)
+  const uy = -Math.cos(a);      // y вниз на экране, потому инвертируем косинус
+
+  // Нос (красный): 6 крупных пикселей
+  for (let k=1;k<=fwd;k++){
+    const x = Math.round(cx + ux*k);
+    const y = Math.round(cy + uy*k);
+    pset(x,y,'#d22');
+  }
+  // Хвост (серый): 3 крупных пикселя
+  for (let k=1;k<=back;k++){
+    const x = Math.round(cx - ux*k);
+    const y = Math.round(cy - uy*k);
+    pset(x,y,'#7a7f86');
+  }
+  // Центральная ось
+  pset(cx, cy, '#c9cdd4');
+}
+
+/* ===== РЕНДЕР ===== */
+function render(){
+  drawBase();
+  let angle = 0;
+  if (myPos){
+    const dir = bearing(myPos.lat, myPos.lon, TARGET.lat, TARGET.lon);
+    angle = (dir - heading + 360) % 360; // поворачиваем относительно телефона
+  }
+  drawNeedle(angle);
+  requestAnimationFrame(render);
+}
+render();
+
+/* ===== ГЕОЛОКАЦИЯ ===== */
+if ('geolocation' in navigator){
+  navigator.geolocation.watchPosition(p=>{
+    myPos = { lat: p.coords.latitude, lon: p.coords.longitude };
+    info.textContent = `Моё место: ${myPos.lat.toFixed(5)}, ${myPos.lon.toFixed(5)}. Компас активен.`;
+  }, e=>{
+    info.textContent = 'Геолокация не доступна: ' + e.message + '\nСовет: открой страницу по HTTPS и включи геолокацию в браузере.';
+  }, { enableHighAccuracy:true, maximumAge:1000, timeout:10000 });
+} else {
+  info.textContent = 'Этот браузер не поддерживает геолокацию.';
+}
+
+/* ===== ОРИЕНТАЦИЯ УСТРОЙСТВА ===== */
+function onOrientation(e){
+  // iOS Safari: готовый заголовок в градусах относительно севера
+  if (typeof e.webkitCompassHeading === 'number'){
+    heading = e.webkitCompassHeading; // 0..360, по часовой
+  } else if (e.absolute || e.alpha != null){
+    // Стандарт: alpha=0 — север, растёт по часовой; приведём к той же системе
+    heading = 360 - e.alpha; // обращаем, чтобы возрастало по часовой от севера
+  }
+}
+
+function tryEnableOrientation(){
+  if (typeof DeviceOrientationEvent !== 'undefined' &&
+      typeof DeviceOrientationEvent.requestPermission === 'function'){
+    // iOS: требуется явное разрешение жестом
+    enableBtn.style.display = 'inline-block';
+    enableBtn.onclick = async ()=>{
+      try{
+        const st = await DeviceOrientationEvent.requestPermission();
+        if (st === 'granted'){
+          window.addEventListener('deviceorientation', onOrientation, true);
+          enableBtn.style.display = 'none';
+          info.textContent = (myPos ? info.textContent : 'Компас включён. Ожидание геолокации…');
+        } else {
+          info.textContent = 'Разрешение на компас отклонено.';
+        }
+      }catch(err){ info.textContent = 'Ошибка разрешения: '+err; }
+    };
+  } else {
+    // Android/другие
+    window.addEventListener('deviceorientationabsolute', onOrientation, true);
+    window.addEventListener('deviceorientation', onOrientation, true);
+  }
+}
+tryEnableOrientation();
+</script>
+</body>
+</html>
