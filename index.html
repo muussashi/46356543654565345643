@@ -1,97 +1,122 @@
-<!DOCTYPE html>
+<script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function filledCell(cell) {
+          return cell !== '' && cell != null;
+        }
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row => row.some(filledCell));
+
+                // Heuristic to find the header row by ignoring rows with fewer filled cells than the next row
+                var headerRowIndex = filteredData.findIndex((row, index) =>
+                  row.filter(filledCell).length >= filteredData[index + 1]?.filter(filledCell).length
+                );
+                // Fallback
+                if (headerRowIndex === -1 || headerRowIndex > 25) {
+                  headerRowIndex = 0;
+                }
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData.slice(headerRowIndex)); // Create a new sheet from filtered array of arrays
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+        </script><!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Пиксельный компас домой</title>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <style>
   :root { color-scheme: dark; }
-  body{
+  body {
     margin:0; height:100dvh; display:flex; flex-direction:column;
     align-items:center; justify-content:center; background:#0c0c0c; color:#eee;
     font-family:system-ui, Arial, sans-serif; gap:14px; padding:12px;
   }
-  canvas{ image-rendering: pixelated; image-rendering: crisp-edges; }
-  #info{opacity:.9; font-size:14px; text-align:center; max-width:640px}
-  button{
+  canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
+  #info { opacity:.9; font-size:14px; text-align:center; max-width:640px; }
+  button {
     padding:10px 14px; border:0; border-radius:14px; background:#222; color:#eee;
-    box-shadow:0 6px 24px #0006; cursor:pointer; display:none;
+    box-shadow:0 6px 24px #0006; cursor:pointer;
   }
+  #mapBtn { display:inline-block; }
+  #mapContainer { display:none; width:100%; max-width:640px; height:300px; }
+  #map { width:100%; height:100%; }
 </style>
 </head>
 <body>
   <canvas id="compass" width="384" height="384" aria-label="Пиксельный компас"></canvas>
   <div id="info">Ожидание разрешений…</div>
   <button id="enableBtn">Включить компас (iPhone)</button>
+  <button id="mapBtn">Выбрать точку на карте</button>
+  <div id="mapContainer"><div id="map"></div></div>
 
 <script>
 /* ===== НАСТРОЙКИ ===== */
-// Точка назначения — твой дом (из сообщения): 40°21'50.9"N 49°56'48.3"E
-const TARGET = { lat: 40.364139, lon: 49.946750 };
-
-// Сетка (мало крупных пикселей):
-const GRID = 24;     // 24×24 «крупных пикселей» (можно 20, 16 и т.д.)
-const PIX  = 16;     // размер одного крупного пикселя в экранах (канвас = GRID*PIX)
-
-/* ===== КАНВАС ===== */
+const TARGET = { lat: 40.364139, lon: 49.946750 }; // Начальная точка (можно менять тыканьем)
+const GRID = 24;     // Сетка компаса
+const PIX = 16;      // Пиксель компаса
 const cvs = document.getElementById('compass');
 const ctx = cvs.getContext('2d');
-cvs.width  = GRID * PIX;
+cvs.width = GRID * PIX;
 cvs.height = GRID * PIX;
 
 /* ===== СОСТОЯНИЕ ===== */
-let heading = 0;             // куда смотрит телефон (0° = север, по часовой)
-let myPos = null;            // {lat, lon}
+let heading = 0;
+let myPos = null;
+let target = TARGET; // Динамическая цель
+let distance = 0;
 const info = document.getElementById('info');
 const enableBtn = document.getElementById('enableBtn');
+const mapBtn = document.getElementById('mapBtn');
+const mapContainer = document.getElementById('mapContainer');
+let map = null;
 
 /* ===== ВСПОМОГАТЕЛЬНОЕ ===== */
 const toRad = d => d * Math.PI/180;
 const toDeg = r => r * 180/Math.PI;
 
-function bearing(lat1, lon1, lat2, lon2){
+// Расчёт дистанции (haversine)
+function getDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371e3; // Радиус Земли (м)
+  const φ1 = toRad(lat1), φ2 = toRad(lat2);
+  const Δφ = toRad(lat2 - lat1);
+  const Δλ = toRad(lon2 - lon1);
+  const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+            Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ/2) * Math.sin(Δλ/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c; // Дистанция в метрах
+}
+
+// Азимут (направление)
+function bearing(lat1, lon1, lat2, lon2) {
   const φ1 = toRad(lat1), φ2 = toRad(lat2), Δλ = toRad(lon2-lon1);
   const y = Math.sin(Δλ) * Math.cos(φ2);
   const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
-  return (toDeg(Math.atan2(y,x)) + 360) % 360; // 0..360 (0 = север)
+  return (toDeg(Math.atan2(y,x)) + 360) % 360;
 }
 
-function pset(x, y, color){
-  // Рисуем один «крупный пиксель» по координатам сетки
-  ctx.fillStyle = color;
-  ctx.fillRect(Math.round(x)*PIX, Math.round(y)*PIX, PIX, PIX);
-}
-
-/* ===== ФОН КОМПАСА (минимализм, без меток) ===== */
-function drawBase(){
-  ctx.clearRect(0,0,cvs.width,cvs.height);
-  const cx = GRID/2, cy = GRID/2;
-  const rOuter = GRID*0.48;
-  const rRim   = GRID*0.43;
-  const rFace  = GRID*0.38;
-
-  for (let y=0;y<GRID;y++){
-    for (let x=0;x<GRID;x++){
-      const dx = x+0.5 - cx, dy = y+0.5 - cy;
-      const r = Math.hypot(dx, dy);
-      let col = null;
-      if (r <= rFace){                    // лицевая часть (тёмная линза)
-        col = '#1b1d20';
-      } else if (r <= rRim){              // металлический обод
-        col = '#666b74';
-      } else if (r <= rOuter){            // внешняя окантовка
-        col = '#0e0f12';
-      }
-      if (col){
-        const noise = ((x^y)&1) ? -10 : 0; // лёгкая пиксельная текстура
-        col = shade(col, noise);
-        pset(x,y,col);
-      }
-    }
-  }
-}
-
-function shade(hex, delta){
+// Цвет с шумом
+function shade(hex, delta) {
   const n = v => Math.max(0, Math.min(255, v+delta));
   const r = n(parseInt(hex.slice(1,3),16));
   const g = n(parseInt(hex.slice(3,5),16));
@@ -99,87 +124,161 @@ function shade(hex, delta){
   return `rgb(${r},${g},${b})`;
 }
 
-/* ===== СТРЕЛКА «как в майне»: 6 красных + 3 серых ===== */
-// Мы рисуем точки ровно по сетке от центра: 6 шагов вперёд (к носу) и 3 назад (хвост).
-function drawNeedle(angleDeg){
-  const cx = Math.round(GRID/2), cy = Math.round(GRID/2);
-  const fwd = 6;  // 6 красных
-  const back = 3; // 3 серых
-  const a = toRad(angleDeg);
-  const ux = Math.sin(a);       // единичный вектор по углу (x по часовой восток)
-  const uy = -Math.cos(a);      // y вниз на экране, потому инвертируем косинус
+/* ===== КОМПАС ===== */
+function pset(x, y, color) {
+  ctx.fillStyle = color;
+  ctx.fillRect(Math.round(x)*PIX, Math.round(y)*PIX, PIX, PIX);
+}
 
-  // Нос (красный): 6 крупных пикселей
-  for (let k=1;k<=fwd;k++){
+function drawBase() {
+  ctx.clearRect(0,0,cvs.width,cvs.height);
+  const cx = GRID/2, cy = GRID/2;
+  const rOuter = GRID*0.48;
+  const rRim = GRID*0.43;
+  const rFace = GRID*0.38;
+  for (let y=0; y<GRID; y++) {
+    for (let x=0; x<GRID; x++) {
+      const dx = x+0.5 - cx, dy = y+0.5 - cy;
+      const r = Math.hypot(dx, dy);
+      let col = null;
+      if (r <= rFace) col = '#1b1d20';
+      else if (r <= rRim) col = '#666b74';
+      else if (r <= rOuter) col = '#0e0f12';
+      if (col) {
+        const noise = ((x^y)&1) ? -10 : 0;
+        col = shade(col, noise);
+        pset(x,y,col);
+      }
+    }
+  }
+}
+
+function drawNeedle(angleDeg) {
+  const cx = Math.round(GRID/2), cy = Math.round(GRID/2);
+  const fwd = 6; const back = 3;
+  const a = toRad(angleDeg);
+  const ux = Math.sin(a); const uy = -Math.cos(a);
+  for (let k=1; k<=fwd; k++) {
     const x = Math.round(cx + ux*k);
     const y = Math.round(cy + uy*k);
     pset(x,y,'#d22');
   }
-  // Хвост (серый): 3 крупных пикселя
-  for (let k=1;k<=back;k++){
+  for (let k=1; k<=back; k++) {
     const x = Math.round(cx - ux*k);
     const y = Math.round(cy - uy*k);
     pset(x,y,'#7a7f86');
   }
-  // Центральная ось
   pset(cx, cy, '#c9cdd4');
 }
 
-/* ===== РЕНДЕР ===== */
-function render(){
+/* ===== КАРТА ===== */
+function initMap() {
+  map = L.map('map').setView([target.lat, target.lon], 13);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap'
+  }).addTo(map);
+  let marker = L.marker([target.lat, target.lon]).addTo(map);
+  map.on('click', e => {
+    target.lat = e.latlng.lat;
+    target.lon = e.latlng.lng;
+    marker.setLatLng(e.latlng);
+  });
+  // Пунктирный путь (canvas поверх карты)
+  const canvasOverlay = L.canvasOverlay().drawing((canvas, params) => {
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    if (!myPos) return;
+    const start = map.latLngToContainerPoint([myPos.lat, myPos.lon]);
+    const end = map.latLngToContainerPoint([target.lat, target.lon]);
+    const dx = end.x - start.x, dy = end.y - start.y;
+    const len = Math.hypot(dx, dy);
+    const ux = dx/len, uy = dy/len;
+    // Пунктир: красные/серые пиксели
+    for (let d=0; d<len; d+=20) {
+      ctx.fillStyle = (Math.floor(d/20)%2) ? '#d22' : '#7a7f86';
+      ctx.fillRect(start.x + ux*d - 4, start.y + uy*d - 4, 8, 8);
+    }
+    // Здания (рандомные блоки)
+    for (let i=0; i<10; i++) {
+      const offset = Math.random()*100 - 50;
+      const px = start.x + ux*d + offset*(uy+0.1);
+      const py = start.y + uy*d - offset*(ux+0.1);
+      ctx.fillStyle = '#666b74';
+      ctx.fillRect(px-12, py-12, 24, 24);
+    }
+  }).addTo(map);
+}
+mapBtn.onclick = () => {
+  mapContainer.style.display = mapContainer.style.display === 'none' ? 'block' : 'none';
+  if (mapContainer.style.display === 'block' && !map) initMap();
+  if (map) map.invalidateSize();
+};
+
+/* ===== РЕНДЕР И ИНСТРУКЦИИ ===== */
+function render() {
   drawBase();
   let angle = 0;
-  if (myPos){
-    const dir = bearing(myPos.lat, myPos.lon, TARGET.lat, TARGET.lon);
-    angle = (dir - heading + 360) % 360; // поворачиваем относительно телефона
+  if (myPos) {
+    distance = getDistance(myPos.lat, myPos.lon, target.lat, target.lon);
+    const dir = bearing(myPos.lat, myPos.lon, target.lat, target.lon);
+    angle = (dir - heading + 360) % 360;
+    let direction = '';
+    const relAngle = (angle + 360) % 360;
+    if (relAngle < 10 || relAngle > 350) direction = 'прямо';
+    else if (relAngle < 80) direction = 'направо';
+    else if (relAngle < 100) direction = 'резко направо';
+    else if (relAngle < 170) direction = 'налево';
+    else if (relAngle < 190) direction = 'резко налево';
+    else if (relAngle < 260) direction = 'направо';
+    else direction = 'налево';
+    info.textContent = `Иди ${direction} ${Math.round(distance)}м. Точка: ${target.lat.toFixed(5)}, ${target.lon.toFixed(5)}.`;
   }
   drawNeedle(angle);
+  if (map) map.eachLayer(layer => {
+    if (layer._canvas) layer._canvas._update();
+  });
   requestAnimationFrame(render);
 }
 render();
 
 /* ===== ГЕОЛОКАЦИЯ ===== */
-if ('geolocation' in navigator){
-  navigator.geolocation.watchPosition(p=>{
+if ('geolocation' in navigator) {
+  navigator.geolocation.watchPosition(p => {
     myPos = { lat: p.coords.latitude, lon: p.coords.longitude };
-    info.textContent = `Моё место: ${myPos.lat.toFixed(5)}, ${myPos.lon.toFixed(5)}. Компас активен.`;
-  }, e=>{
-    info.textContent = 'Геолокация не доступна: ' + e.message + '\nСовет: открой страницу по HTTPS и включи геолокацию в браузере.';
-  }, { enableHighAccuracy:true, maximumAge:1000, timeout:10000 });
+    info.textContent = `Иди к точке: ${target.lat.toFixed(5)}, ${target.lon.toFixed(5)}.`;
+  }, e => {
+    info.textContent = 'Геолокация не доступна: ' + e.message + '\nСовет: открой страницу по HTTPS и включи геолокацию.';
+  }, { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 });
 } else {
-  info.textContent = 'Этот браузер не поддерживает геолокацию.';
+  info.textContent = 'Браузер не поддерживает геолокацию.';
 }
 
 /* ===== ОРИЕНТАЦИЯ УСТРОЙСТВА ===== */
-function onOrientation(e){
-  // iOS Safari: готовый заголовок в градусах относительно севера
-  if (typeof e.webkitCompassHeading === 'number'){
-    heading = e.webkitCompassHeading; // 0..360, по часовой
-  } else if (e.absolute || e.alpha != null){
-    // Стандарт: alpha=0 — север, растёт по часовой; приведём к той же системе
-    heading = 360 - e.alpha; // обращаем, чтобы возрастало по часовой от севера
+function onOrientation(e) {
+  if (typeof e.webkitCompassHeading === 'number') {
+    heading = e.webkitCompassHeading;
+  } else if (e.absolute || e.alpha != null) {
+    heading = 360 - e.alpha;
   }
 }
 
-function tryEnableOrientation(){
+function tryEnableOrientation() {
   if (typeof DeviceOrientationEvent !== 'undefined' &&
-      typeof DeviceOrientationEvent.requestPermission === 'function'){
-    // iOS: требуется явное разрешение жестом
+      typeof DeviceOrientationEvent.requestPermission === 'function') {
     enableBtn.style.display = 'inline-block';
-    enableBtn.onclick = async ()=>{
-      try{
+    enableBtn.onclick = async () => {
+      try {
         const st = await DeviceOrientationEvent.requestPermission();
-        if (st === 'granted'){
+        if (st === 'granted') {
           window.addEventListener('deviceorientation', onOrientation, true);
           enableBtn.style.display = 'none';
           info.textContent = (myPos ? info.textContent : 'Компас включён. Ожидание геолокации…');
         } else {
           info.textContent = 'Разрешение на компас отклонено.';
         }
-      }catch(err){ info.textContent = 'Ошибка разрешения: '+err; }
+      } catch(err) { info.textContent = 'Ошибка разрешения: '+err; }
     };
   } else {
-    // Android/другие
     window.addEventListener('deviceorientationabsolute', onOrientation, true);
     window.addEventListener('deviceorientation', onOrientation, true);
   }
